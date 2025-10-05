@@ -1,8 +1,10 @@
 const express = require('express');
 const apiRouter = require('./api');
 const router = express.Router();
+const stripeRoutes = require('./stripeRoutes');
 
 router.use('/api/v1', apiRouter);
+router.use('/api/v1/stripe', stripeRoutes);
 
 router.use((req, res) => {
   res.status(404).send('page is not found');
