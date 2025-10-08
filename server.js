@@ -13,11 +13,15 @@ app.use(express.urlencoded({ extended: true }));
 // ✅ Enable CORS
 app.use(
   cors({
-    origin: 'http://localhost:5173',
+    origin: [
+      'http://localhost:5173',
+      'https://bestitembuy.com',
+    ],
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     credentials: true,
   })
 );
+
 
 // Serve static uploads
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
