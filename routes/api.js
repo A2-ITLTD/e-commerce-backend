@@ -85,13 +85,10 @@ router.delete(
 // // -------------------- Order Routes --------------------
 router.post('/orders', authMiddleware, orderController.createOrder);
 router.get('/orders/:id', authMiddleware, orderController.getOrderById);
-router.put(
-  '/orders/:id/status',
-  authMiddleware,
-  orderController.updateOrderStatus
-);
+router.put('/orders/:id', authMiddleware, orderController.updateOrderStatus);
 router.delete('/orders/:id', authMiddleware, orderController.deleteOrder);
 router.get('/user/orders', authMiddleware, orderController.getUserOrders);
+router.post('/orders/confirm-payment', orderController.confirmStripePayment);
 
 // -------------------- Cart Routes --------------------
 router.get('/cart', authMiddleware, cartController.getCart);

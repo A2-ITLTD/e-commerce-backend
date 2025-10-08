@@ -8,8 +8,25 @@ const { sanitizeInput } = require('../utils/sanitizeInput');
 // @access  Private
 const createOrder = async (req, res) => {
   try {
-    const { items, shippingAddress, paymentMethod } = req.body;
+    const {
+      items,
+      shippingAddress,
+      paymentMethod,
+      total,
+      tax,
+      shippingCost,
+      grandTotal,
+    } = req.body;
     const userId = req.user.id;
+
+    console.log('Creating order with data:', {
+      items: items.length,
+      paymentMethod,
+      total,
+      tax,
+      shippingCost,
+      grandTotal,
+    });
 
     if (!items || items.length === 0) {
       return res.status(400).json({ message: 'No items in order' });
@@ -17,27 +34,46 @@ const createOrder = async (req, res) => {
 
     const cleanShipping = sanitizeInput(shippingAddress);
 
-    // --- Calculate totals ---
-    let total = 0;
-    let discountTotal = 0;
+    // Validate products and calculate totals if not provided
+    let calculatedTotal = total;
+    let calculatedGrandTotal = grandTotal;
 
-    for (const item of items) {
-      const product = await Product.findById(item.product);
-      if (!product)
-        return res.status(404).json({ message: 'Product not found' });
+    if (!total || !grandTotal) {
+      calculatedTotal = 0;
+      let discountTotal = 0;
 
-      const price = product.price;
-      const quantity = item.quantity;
-      total += price * quantity;
+      for (const item of items) {
+        const product = await Product.findById(item.product);
+        if (!product) {
+          return res.status(404).json({
+            message: `Product not found: ${item.product}`,
+          });
+        }
 
-      if (item.discountPrice) {
-        discountTotal += (price - item.discountPrice) * quantity;
+        if (product.stock < item.quantity) {
+          return res.status(400).json({
+            message: `Insufficient stock for ${product.title}. Available: ${product.stock}`,
+          });
+        }
+
+        const price = item.price || product.price;
+        calculatedTotal += price * item.quantity;
+
+        if (item.discountPrice) {
+          discountTotal += (product.price - item.discountPrice) * quantity;
+        }
       }
+
+      const calculatedShippingCost = calculatedTotal > 50 ? 0 : 9.99;
+      const calculatedTax = calculatedTotal * 0.1;
+      calculatedGrandTotal =
+        calculatedTotal +
+        calculatedShippingCost +
+        calculatedTax -
+        discountTotal;
     }
 
-    const grandTotal = total - discountTotal;
-
-    // --- Generate Order ID ---
+    // Generate Order ID
     const generateOrderId = () => {
       const timestamp = Date.now().toString().slice(-6);
       const random = Math.floor(1000 + Math.random() * 9000);
@@ -46,48 +82,162 @@ const createOrder = async (req, res) => {
 
     const orderId = generateOrderId();
 
-    // --- Create order in DB (initially unpaid) ---
-    const order = new Order({
+    // Prepare order items with safe image access
+    const orderItems = items.map((item) => ({
+      product: item.product,
+      quantity: item.quantity,
+      price: item.price,
+      name: item.name || `Product ${item.product}`,
+    }));
+
+    // Create order object - using ONLY valid enum values from your schema
+    const orderData = {
       user: userId,
-      items,
-      total,
-      discountTotal,
-      grandTotal,
-      shippingAddress: cleanShipping,
-      paymentMethod,
-      orderId,
-    });
+      items: orderItems,
+      total: calculatedTotal,
+      discountTotal: 0,
+      grandTotal: calculatedGrandTotal,
+      orderId: orderId,
+      shippingAddress: {
+        fullName: cleanShipping.fullName,
+        phone: cleanShipping.phone,
+        street: cleanShipping.street,
+        city: cleanShipping.city,
+        state: cleanShipping.state,
+        postalCode: cleanShipping.postalCode, // Added postalCode
+        country: cleanShipping.country,
+      },
+      paymentMethod: paymentMethod,
+      paymentStatus: 'pending', // Valid enum value: 'pending'
+      status: 'pending', // Valid enum value: 'pending'
+      paymentDetails: {},
+      trackingHistory: [
+        {
+          location: 'Order placed',
+          status: 'pending',
+          date: new Date(),
+        },
+      ],
+    };
 
-    // --- If Stripe Payment ---
+    // Handle Stripe Payment
     if (paymentMethod === 'Stripe') {
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.round(grandTotal * 100),
-        currency: 'usd',
-        metadata: { orderId },
-      });
+      try {
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: Math.round(calculatedGrandTotal * 100), // Convert to cents
+          currency: 'usd',
+          metadata: {
+            orderId: orderId,
+            userId: userId.toString(),
+          },
+          automatic_payment_methods: {
+            enabled: true,
+          },
+        });
 
-      order.paymentDetails = {
-        id: paymentIntent.id,
-        paidAt: null,
-      };
+        // Add Stripe payment details
+        orderData.paymentDetails = {
+          id: paymentIntent.id,
+          status: 'requires_payment_method',
+        };
 
-      const savedOrder = await order.save();
+        const order = new Order(orderData);
+        const savedOrder = await order.save();
 
-      return res.status(201).json({
-        clientSecret: paymentIntent.client_secret,
-        order: savedOrder,
-      });
+        return res.status(201).json({
+          clientSecret: paymentIntent.client_secret,
+          order: savedOrder,
+          requiresAction: paymentIntent.status === 'requires_action',
+        });
+      } catch (stripeError) {
+        console.error('Stripe payment intent error:', stripeError);
+        return res.status(400).json({
+          message: 'Payment processing failed',
+          error: stripeError.message,
+        });
+      }
     }
 
-    // --- Otherwise, COD (or PayPal) ---
+    // Handle COD payment
+    const order = new Order(orderData);
     const savedOrder = await order.save();
+
+    // Update product stock for COD orders
+    if (paymentMethod === 'COD') {
+      for (const item of items) {
+        await Product.findByIdAndUpdate(item.product, {
+          $inc: { stock: -item.quantity },
+        });
+      }
+    }
+
     res.status(201).json(savedOrder);
   } catch (error) {
     console.error('Create order error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({
+      message: 'Server error creating order',
+      error: error.message,
+    });
   }
 };
 
+// Confirm Stripe Payment
+const confirmStripePayment = async (req, res) => {
+  try {
+    const { paymentIntentId, orderId } = req.body;
+
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    if (paymentIntent.status === 'succeeded') {
+      const order = await Order.findById(orderId);
+      if (!order) {
+        return res.status(404).json({ message: 'Order not found' });
+      }
+
+      // Update with valid enum values
+      order.status = 'processing';
+      order.paymentStatus = 'processing';
+      order.paymentDetails.paidAt = new Date();
+      order.paymentDetails.email = paymentIntent.receipt_email;
+
+      // Add to tracking history
+      order.trackingHistory.push({
+        location: 'Payment confirmed',
+        status: 'processing',
+        date: new Date(),
+      });
+
+      // Update product stock
+      for (const item of order.items) {
+        await Product.findByIdAndUpdate(item.product, {
+          $inc: { stock: -item.quantity },
+        });
+      }
+
+      await order.save();
+
+      res.json({
+        success: true,
+        order,
+        message: 'Payment confirmed successfully',
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        message: 'Payment not completed',
+        status: paymentIntent.status,
+      });
+    }
+  } catch (error) {
+    console.error('Confirm payment error:', error);
+    res.status(500).json({
+      message: 'Error confirming payment',
+      error: error.message,
+    });
+  }
+};
+
+// ... rest of your functions remain the same
 // @desc    Get all orders (Admin)
 // @route   GET /api/orders
 // @access  Admin
@@ -133,102 +283,50 @@ const getOrderById = async (req, res) => {
   //   res.status(500).json({ message: 'Server error' });
   // }
 };
-
-// @desc    Update order status (Admin)
-// @route   PUT /api/orders/:id/status
-// @access  Admin
 // @desc    Update order status (Admin)
 // @route   PUT /api/orders/:id/status
 // @access  Admin
 const updateOrderStatus = async (req, res) => {
   try {
-    console.log('=== UPDATE ORDER STATUS REQUEST ===');
-    console.log('Request params:', req.params);
-    console.log('Request body:', req.body);
-    console.log('Request headers:', req.headers['content-type']);
+    const { id } = req.params; // order ID from URL
+    const { status, paymentStatus, location } = req.body;
 
-    let { status, location } = req.body;
-
-    // Log the raw received data
-    console.log('Raw status:', status, 'Type:', typeof status);
-    console.log('Raw location:', location, 'Type:', typeof location);
-
-    // Handle different data structures
-    if (status && typeof status === 'object') {
-      console.log('Status is an object, extracting values...');
-
-      // If the entire request body is nested under status
-      if (status.status && status.location) {
-        console.log('Found nested status and location');
-        location = status.location;
-        status = status.status;
-      }
-      // Handle other possible object structures
-      else if (status.value) {
-        status = status.value;
-      } else if (status.label) {
-        status = status.label;
-      }
-    }
-
-    console.log('Processed status:', status);
-    console.log('Processed location:', location);
-
-    // Validate required fields with better error messages
-    if (!status) {
-      console.log('Validation failed: Status is required');
-      return res.status(400).json({
-        message: 'Status is required',
-        receivedData: req.body,
-      });
-    }
-
-    if (!location) {
-      console.log('Validation failed: Location is required');
-      return res.status(400).json({
-        message: 'Location is required',
-        receivedData: req.body,
-      });
-    }
-
-    const order = await Order.findById(req.params.id);
+    // Find existing order
+    const order = await Order.findById(id);
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
 
-    console.log('Updating order:', order._id);
-    console.log('New status:', status);
-    console.log('New location:', location);
+    // Update order status if provided
+    if (status) order.status = status;
 
-    // Update status
-    order.status = status;
+    // Update payment status if provided
+    if (paymentStatus) order.paymentStatus = paymentStatus;
 
-    // Add to tracking history
-    order.trackingHistory.push({
-      status: status,
-      location: location,
-      timestamp: new Date(),
-    });
+    // Add a tracking update if location provided
+    if (location) {
+      order.trackingHistory.push({
+        location,
+        status: status || order.status,
+        date: new Date(),
+      });
+    }
 
+    // Save updated order
     const updatedOrder = await order.save();
 
-    console.log('Order updated successfully');
-
-    res.json({
-      success: true,
+    res.status(200).json({
       message: 'Order updated successfully',
       order: updatedOrder,
     });
   } catch (error) {
-    console.error('Update order status error:', error);
+    console.error('Update order error:', error);
     res.status(500).json({
-      message: 'Server error',
+      message: 'Server error updating order',
       error: error.message,
-      receivedData: req.body,
     });
   }
 };
-
 // @desc    Delete order (Admin)
 // @route   DELETE /api/orders/:id
 // @access  Admin
@@ -251,4 +349,5 @@ module.exports = {
   getOrderById,
   updateOrderStatus,
   deleteOrder,
+  confirmStripePayment,
 };
